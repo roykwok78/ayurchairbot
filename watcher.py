@@ -118,6 +118,10 @@ def format_item(it, include_date=False):
     return f"{it['title']} ¥{it['price']:,}{date_str}\n{it['url']}"
 
 def main():
+        # Debug: send test message
+    send_telegram("📡 Mercari Watch 測試訊息：workflow 已啟動")
+    print(f"DEBUG: ALWAYS_SEND_LATEST = {ALWAYS_SEND_LATEST}, LATEST_COUNT = {LATEST_COUNT}")
+    
     seen = load_seen()
     items = fetch_list()
     new_items = [it for it in items if it["id"] not in seen and match_filters(it["title"], it["price"])]
