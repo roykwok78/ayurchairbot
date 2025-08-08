@@ -1,12 +1,14 @@
-import os, json, re, time
+import os, json, re, time, datetime
 import requests
 from bs4 import BeautifulSoup
 
-SEARCH_URL = os.getenv("SEARCH_URL", "https://jp.mercari.com/zh-TW/search?keyword=ayur%20chair&order=desc&sort=created_time")
+SEARCH_URL = os.getenv("SEARCH_URL") or "https://jp.mercari.com/zh-TW/search?keyword=ayur%20chair&order=desc&sort=created_time&status=on_sale"
 KEYWORDS = [s.strip().lower() for s in os.getenv("KEYWORDS", "ayur chair").split(",") if s.strip()]
-COLOR_KEYWORDS = [s.strip().lower() for s in os.getenv("COLOR_KEYWORDS", "").split(",") if s.strip()]  # 例: "black,黑,白,white"
-MIN_PRICE = int(os.getenv("MIN_PRICE", "0") or 0)
-MAX_PRICE = int(os.getenv("MAX_PRICE", "0") or 0)  # 0 = 不限制
+COLOR_KEYWORDS = [s.strip().lower() for s in os.getenv("COLOR_KEYWORDS", "").split(",") if s.strip()]
+MIN_PRICE = int(os.getenv("MIN_PRICE") or "0")
+MAX_PRICE = int(os.getenv("MAX_PRICE") or "0")
+LATEST_COUNT = int(os.getenv("LATEST_COUNT") or "5")
+ALWAYS_SEND_LATEST = os.getenv("ALWAYS_SEND_LATEST") == "1"
 SEEN_FILE = "data/seen_ids.json"
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -64,27 +66,23 @@ def parse_price(text):
     digits = re.findall(r"\d+", text)
     return int(digits[0]) if digits else 0
 
-def fetch_new_items():
+def fetch_list():
     r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
     html = r.text
     soup = BeautifulSoup(html, "html.parser")
-
-    links = set(m.group(0) for m in ITEM_URL_RE.finditer(html))
+    links = list(dict.fromkeys(m.group(0) for m in ITEM_URL_RE.finditer(html)))  # 保留原排序
     items = []
     for url in links:
         title, price = "ayur chair", 0
-        # 嘗試就近抓標題／價錢
         try:
             item_id = url.rsplit("/",1)[-1]
-            # 定位到含該 href 的 a 標籤
             a = soup.find("a", href=re.compile(r"/item/" + re.escape(item_id)))
             if a:
                 card = a.find_parent()
                 if card:
                     text_block = card.get_text(" ", strip=True)
                     price = parse_price(text_block)
-                    # 嘗試找較可讀的標題
                     for tag in card.find_all(["img","p","div","span"], limit=8):
                         t = (tag.get("alt") or tag.get_text(" ", strip=True) or "").strip()
                         if 6 <= len(t) <= 120 and "￥" not in t:
@@ -95,23 +93,57 @@ def fetch_new_items():
         items.append({"id": url.rsplit("/",1)[-1], "title": title, "price": price, "url": url})
     return items
 
+def fetch_date(item_url):
+    try:
+        r = requests.get(item_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        meta = soup.find("meta", attrs={"property": "og:updated_time"})
+        if not meta:
+            meta = soup.find("meta", attrs={"property": "product:price:updated_time"})
+        if meta and meta.get("content"):
+            utc_time = datetime.datetime.fromisoformat(meta["content"].replace("Z", "+00:00"))
+            jst_time = utc_time.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+            return jst_time.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    return ""
+
+def format_item(it, include_date=False):
+    date_str = ""
+    if include_date:
+        dt = fetch_date(it['url'])
+        if dt:
+            date_str = f"\n上架：{dt}"
+    return f"{it['title']} ¥{it['price']:,}{date_str}\n{it['url']}"
+
 def main():
     seen = load_seen()
-    items = fetch_new_items()
-    items = sorted(items, key=lambda x: x["id"], reverse=True)
+    items = fetch_list()
+    new_items = [it for it in items if it["id"] not in seen and match_filters(it["title"], it["price"])]
 
-    pushed = 0
-    for it in items:
-        if it["id"] in seen:
-            continue
-        if match_filters(it["title"], it["price"]):
-            msg = f"🆕 Mercari 新上架：{it['title']}\n價格：約¥{it['price']:,}\n{it['url']}"
-            send_telegram(msg)
-            pushed += 1
+    messages = []
+    if new_items:
+        msg = "🆕 Mercari 新上架 ayur chair\n\n"
+        for idx, it in enumerate(new_items, 1):
+            msg += f"{idx}. {format_item(it, include_date=True)}\n\n"
+        messages.append(msg.strip())
+
+    if ALWAYS_SEND_LATEST:
+        latest = items[:LATEST_COUNT]
+        msg2 = f"📌 最新 {LATEST_COUNT} 個在售 ayur chair\n\n"
+        for idx, it in enumerate(latest, 1):
+            msg2 += f"{idx}. {format_item(it, include_date=True)}\n\n"
+        messages.append(msg2.strip())
+
+    for it in new_items:
         seen.add(it["id"])
-
     save_seen(seen)
-    print(f"Done. Pushed {pushed} items.")
+
+    for msg in messages:
+        send_telegram(msg)
+
+    print(f"Done. Pushed {len(new_items)} new items, plus latest list: {ALWAYS_SEND_LATEST}")
 
 if __name__ == "__main__":
     time.sleep(1)
