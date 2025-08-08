@@ -65,6 +65,7 @@ def match_filters(title: str, price: int) -> bool:
 
 # ① 用 Playwright 抓取（渲染後的 DOM）
 def fetch_list_playwright():
+    def fetch_list_playwright():
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
@@ -73,21 +74,53 @@ def fetch_list_playwright():
 
     items, seen_ids_local = [], set()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(locale="ja-JP", user_agent=HEADERS["User-Agent"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = browser.new_context(
+            locale="ja-JP",
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1366, "height": 900},
+        )
+        # 隱藏 webdriver 痕跡
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
         page.set_default_timeout(30000)
-        page.goto(SEARCH_URL)
-        # 等商品卡渲染（耐心等，最多 15s）
+
+        page.goto(SEARCH_URL, wait_until="domcontentloaded")
+        # 等網絡空閒一次（渲染完畢）
         try:
-            page.wait_for_selector('a[href^="/item/m"]', timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
 
-        anchors = page.query_selector_all('a[href^="/item/m"]')
-        for a in anchors:
+        # 如果有 cookies/同意彈窗，嘗試點掉
+        try:
+            page.locator("button:has-text('同意')").first.click(timeout=2000)
+        except Exception:
+            pass
+
+        # 自動捲動幾屏，確保 lazyload 完成
+        try:
+            for _ in range(6):
+                page.mouse.wheel(0, 1800)
+                page.wait_for_timeout(1200)
+        except Exception:
+            pass
+
+        # 用更鬆手的選擇器：任何 /item/ 開頭的連結
+        anchors = page.locator('a[href^="/item/"]')
+        count = anchors.count()
+        print(f"DEBUG: playwright anchors count = {count}")
+        for i in range(count):
+            a = anchors.nth(i)
             href = a.get_attribute("href") or ""
-            if not href.startswith("/item/m"):
+            if not href.startswith("/item/"):
                 continue
             item_id = href.rsplit("/", 1)[-1]
             if item_id in seen_ids_local:
@@ -95,25 +128,28 @@ def fetch_list_playwright():
             seen_ids_local.add(item_id)
             url = "https://jp.mercari.com" + href
 
-            # 標題：先取 img alt，再取附近文字
+            # 標題：先 img alt，再就近文字
             title = None
-            img = a.query_selector("img")
-            if img:
+            try:
+                img = a.locator("img").first
                 alt = img.get_attribute("alt")
                 if alt:
                     title = alt.strip()
+            except Exception:
+                pass
             if not title:
-                text_block = a.inner_text() or ""
-                if not text_block.strip():
-                    # 向上找兩層取文本
+                text_block = (a.inner_text() or "").strip()
+                if not text_block:
+                    # 向上兩層取文字
                     parent = a
                     for _ in range(2):
                         parent = parent.evaluate_handle("el => el.parentElement")
-                        text_block = (parent.as_element().inner_text() if parent else "") or ""
-                        if text_block.strip():
-                            break
-                # 找像標題的句子
-                for piece in (text_block or "").split("\n"):
+                        el = parent.as_element() if parent else None
+                        if el:
+                            text_block = (el.inner_text() or "").strip()
+                            if text_block:
+                                break
+                for piece in text_block.split("\n"):
                     t = piece.strip()
                     if 6 <= len(t) <= 120 and "￥" not in t and "¥" not in t:
                         title = t
@@ -121,9 +157,7 @@ def fetch_list_playwright():
             if not title:
                 title = "ayur chair"
 
-            # 價錢：從內文找
-            price = parse_price(a.inner_text() or "")
-
+            price = parse_price((a.inner_text() or ""))
             items.append({"id": item_id, "title": title, "price": price, "url": url, "created": None})
 
         context.close()
