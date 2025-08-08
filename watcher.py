@@ -2,6 +2,7 @@ import os, json, re, time, datetime
 import requests
 from bs4 import BeautifulSoup
 
+# -------- 環境變數 / Secrets --------
 SEARCH_URL = os.getenv("SEARCH_URL") or "https://jp.mercari.com/search?keyword=ayur%20chair&order=desc&sort=created_time"
 KEYWORDS = [s.strip().lower() for s in os.getenv("KEYWORDS", "ayur chair").split(",") if s.strip()]
 COLOR_KEYWORDS = [s.strip().lower() for s in os.getenv("COLOR_KEYWORDS", "").split(",") if s.strip()]
@@ -21,6 +22,7 @@ HEADERS = {
 
 PRICE_RE = re.compile(r"[￥¥]\s*([\d,]+)")
 
+# -------- 通用工具 --------
 def load_seen():
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
@@ -57,13 +59,17 @@ def parse_price(text: str) -> int:
 
 def match_filters(title: str, price: int) -> bool:
     t = (title or "").lower()
-    if KEYWORDS and not any(k in t for k in KEYWORDS): return False
-    if COLOR_KEYWORDS and not any(c in t for c in COLOR_KEYWORDS): return False
-    if MIN_PRICE and price < MIN_PRICE: return False
-    if MAX_PRICE and MAX_PRICE > 0 and price > MAX_PRICE: return False
+    if KEYWORDS and not any(k in t for k in KEYWORDS):
+        return False
+    if COLOR_KEYWORDS and not any(c in t for c in COLOR_KEYWORDS):
+        return False
+    if MIN_PRICE and price < MIN_PRICE:
+        return False
+    if MAX_PRICE and MAX_PRICE > 0 and price > MAX_PRICE:
+        return False
     return True
 
-# ① 用 Playwright 抓取（渲染後的 DOM）
+# -------- ① 用 Playwright 抓（渲染後 DOM）--------
 def fetch_list_playwright():
     try:
         from playwright.sync_api import sync_playwright
@@ -86,25 +92,24 @@ def fetch_list_playwright():
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1366, "height": 900},
         )
-        # 隱藏 webdriver 痕跡
+        # 隱藏 webdriver
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
         page.set_default_timeout(30000)
 
         page.goto(SEARCH_URL, wait_until="domcontentloaded")
-        # 等網絡空閒一次（渲染完畢）
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
 
-        # 如果有 cookies/同意彈窗，嘗試點掉
+        # 嘗試點 Cookie 同意
         try:
             page.locator("button:has-text('同意')").first.click(timeout=2000)
         except Exception:
             pass
 
-        # 自動捲動幾屏，確保 lazyload 完成
+        # 捲動幾屏，觸發 lazyload
         try:
             for _ in range(6):
                 page.mouse.wheel(0, 1800)
@@ -112,7 +117,6 @@ def fetch_list_playwright():
         except Exception:
             pass
 
-        # 用更鬆手的選擇器：任何 /item/ 開頭的連結
         anchors = page.locator('a[href^="/item/"]')
         count = anchors.count()
         print(f"DEBUG: playwright anchors count = {count}")
@@ -127,7 +131,7 @@ def fetch_list_playwright():
             seen_ids_local.add(item_id)
             url = "https://jp.mercari.com" + href
 
-            # 標題：先 img alt，再就近文字
+            # 標題
             title = None
             try:
                 img = a.locator("img").first
@@ -139,7 +143,6 @@ def fetch_list_playwright():
             if not title:
                 text_block = (a.inner_text() or "").strip()
                 if not text_block:
-                    # 向上兩層取文字
                     parent = a
                     for _ in range(2):
                         parent = parent.evaluate_handle("el => el.parentElement")
@@ -163,19 +166,21 @@ def fetch_list_playwright():
         browser.close()
     return items
 
-# ② 後備：用 HTML（基本無 JS 時）
+# -------- ② 後備：純 HTML（非 JS）--------
 def fetch_list_html():
     try:
         r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        anchors = soup.select('a[href^="/item/m"]')
+        anchors = soup.select('a[href^="/item/"]')
         items, seen_ids_local = [], set()
         for a in anchors:
             href = a.get("href") or ""
-            if not href.startswith("/item/m"): continue
+            if not href.startswith("/item/"):
+                continue
             item_id = href.rsplit("/", 1)[-1]
-            if item_id in seen_ids_local: continue
+            if item_id in seen_ids_local:
+                continue
             seen_ids_local.add(item_id)
             url = "https://jp.mercari.com" + href
             title = (a.get_text(" ", strip=True) or "ayur chair")
@@ -185,7 +190,7 @@ def fetch_list_html():
     except Exception:
         return []
 
-# ③ 取詳情上架時間（JST）
+# -------- 詳情頁取上架時間（JST）--------
 def fetch_date(item_url: str, created_iso: str | None) -> str:
     if created_iso:
         try:
@@ -214,10 +219,12 @@ def format_item(it, with_date=False) -> str:
     date_str = ""
     if with_date:
         dt = fetch_date(it["url"], it.get("created"))
-        if dt: date_str = f"\n上架：{dt}"
+        if dt:
+            date_str = f"\n上架：{dt}"
     price_part = f" ¥{it['price']:,}" if it["price"] else ""
     return f"{it['title']}{price_part}{date_str}\n{it['url']}"
 
+# -------- 主流程 --------
 def main():
     # Debug ping
     send_telegram("📡 Mercari Watch 測試訊息：workflow 已啟動")
