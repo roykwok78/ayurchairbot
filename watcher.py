@@ -67,6 +67,7 @@ def parse_price(text):
     return int(digits[0]) if digits else 0
 
 def fetch_list():
+    print(f"DEBUG: Found {len(items)} items from search")
     r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
     r.raise_for_status()
     html = r.text
