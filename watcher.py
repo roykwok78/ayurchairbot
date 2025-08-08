@@ -2,7 +2,6 @@ import os, json, re, time, datetime
 import requests
 from bs4 import BeautifulSoup
 
-# ---------- 可用 Secrets 覆蓋 ----------
 SEARCH_URL = os.getenv("SEARCH_URL") or "https://jp.mercari.com/search?keyword=ayur%20chair&order=desc&sort=created_time"
 KEYWORDS = [s.strip().lower() for s in os.getenv("KEYWORDS", "ayur chair").split(",") if s.strip()]
 COLOR_KEYWORDS = [s.strip().lower() for s in os.getenv("COLOR_KEYWORDS", "").split(",") if s.strip()]
@@ -10,9 +9,8 @@ MIN_PRICE = int(os.getenv("MIN_PRICE") or "0")
 MAX_PRICE = int(os.getenv("MAX_PRICE") or "0")
 LATEST_COUNT = int(os.getenv("LATEST_COUNT") or "5")
 ALWAYS_SEND_LATEST = os.getenv("ALWAYS_SEND_LATEST") == "1"
-USE_API = os.getenv("USE_API") == "1"     # 可選：強制用 API
-
 SEEN_FILE = "data/seen_ids.json"
+
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -65,90 +63,97 @@ def match_filters(title: str, price: int) -> bool:
     if MAX_PRICE and MAX_PRICE > 0 and price > MAX_PRICE: return False
     return True
 
-# ---------- 先試 HTML，抓唔到就用 API ----------
-def fetch_list_html():
-    r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    anchors = soup.select('a[href^="/item/m"]')
+# ① 用 Playwright 抓取（渲染後的 DOM）
+def fetch_list_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        print(f"WARN: Playwright 未安裝或不可用: {e}")
+        return []
+
     items, seen_ids_local = [], set()
-    for a in anchors:
-        href = a.get("href") or ""
-        if not href.startswith("/item/m"): continue
-        item_id = href.rsplit("/", 1)[-1]
-        if item_id in seen_ids_local: continue
-        seen_ids_local.add(item_id)
-        url = "https://jp.mercari.com" + href
-        title, price = None, 0
-        img = a.find("img")
-        if img and img.get("alt"): title = img["alt"].strip()
-        card = a
-        for _ in range(3):
-            text_block = (card.get_text(" ", strip=True) or "")
-            if not title:
-                for tag in card.find_all(["p","div","span"], limit=8):
-                    t = (tag.get_text(" ", strip=True) or "").strip()
-                    if 6 <= len(t) <= 120 and "￥" not in t and "¥" not in t:
-                        title = t; break
-            if price == 0: price = parse_price(text_block)
-            if title and price: break
-            card = card.parent or card
-        if not title: title = "ayur chair"
-        items.append({"id": item_id, "title": title, "price": price, "url": url, "created": None})
-    return items
-
-def fetch_list_api():
-    # 從 SEARCH_URL 取 keyword、是否 on_sale
-    from urllib.parse import urlparse, parse_qs
-    qs = parse_qs(urlparse(SEARCH_URL).query)
-    keyword = (qs.get("keyword", ["ayur chair"])[0]).strip()
-    want_on_sale = (qs.get("status", [""])[0] == "on_sale")
-
-    payload = {
-        "pageSize": 60,
-        "searchSessionId": "",
-        "indexRouting": "INDEX_ROUTING_UNSPECIFIED",
-        "thumbnailTypes": ["THUMBNAIL_TYPE_STATIC", "THUMBNAIL_TYPE_MOVIE"],
-        "searchCondition": {
-            "keyword": keyword,
-            "sort": "CREATED_TIME",
-            "order": "DESC",
-            "statuses": ["on_sale"] if want_on_sale else [],
-        },
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "X-Platform": "web",
-        "User-Agent": HEADERS["User-Agent"],
-        "Accept-Language": HEADERS["Accept-Language"],
-    }
-    url = "https://api.mercari.jp/v2/entities:search"
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    items = []
-    for ent in data.get("items", []):
-        m = ent.get("id")
-        if not m: continue
-        title = ent.get("name") or "ayur chair"
-        price = int(ent.get("price") or 0)
-        url = f"https://jp.mercari.com/item/{m}"
-        created = ent.get("updated") or ent.get("created")
-        items.append({"id": m, "title": title, "price": price, "url": url, "created": created})
-    return items
-
-def fetch_list():
-    items = [] if USE_API else fetch_list_html()
-    if USE_API or len(items) == 0:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(locale="ja-JP", user_agent=HEADERS["User-Agent"])
+        page = context.new_page()
+        page.set_default_timeout(30000)
+        page.goto(SEARCH_URL)
+        # 等商品卡渲染（耐心等，最多 15s）
         try:
-            api_items = fetch_list_api()
-            if api_items: return api_items
-        except Exception as e:
-            print(f"WARN: API 後備也失敗: {e}")
+            page.wait_for_selector('a[href^="/item/m"]', timeout=15000)
+        except Exception:
+            pass
+
+        anchors = page.query_selector_all('a[href^="/item/m"]')
+        for a in anchors:
+            href = a.get_attribute("href") or ""
+            if not href.startswith("/item/m"):
+                continue
+            item_id = href.rsplit("/", 1)[-1]
+            if item_id in seen_ids_local:
+                continue
+            seen_ids_local.add(item_id)
+            url = "https://jp.mercari.com" + href
+
+            # 標題：先取 img alt，再取附近文字
+            title = None
+            img = a.query_selector("img")
+            if img:
+                alt = img.get_attribute("alt")
+                if alt:
+                    title = alt.strip()
+            if not title:
+                text_block = a.inner_text() or ""
+                if not text_block.strip():
+                    # 向上找兩層取文本
+                    parent = a
+                    for _ in range(2):
+                        parent = parent.evaluate_handle("el => el.parentElement")
+                        text_block = (parent.as_element().inner_text() if parent else "") or ""
+                        if text_block.strip():
+                            break
+                # 找像標題的句子
+                for piece in (text_block or "").split("\n"):
+                    t = piece.strip()
+                    if 6 <= len(t) <= 120 and "￥" not in t and "¥" not in t:
+                        title = t
+                        break
+            if not title:
+                title = "ayur chair"
+
+            # 價錢：從內文找
+            price = parse_price(a.inner_text() or "")
+
+            items.append({"id": item_id, "title": title, "price": price, "url": url, "created": None})
+
+        context.close()
+        browser.close()
     return items
 
+# ② 後備：用 HTML（基本無 JS 時）
+def fetch_list_html():
+    try:
+        r = requests.get(SEARCH_URL, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        anchors = soup.select('a[href^="/item/m"]')
+        items, seen_ids_local = [], set()
+        for a in anchors:
+            href = a.get("href") or ""
+            if not href.startswith("/item/m"): continue
+            item_id = href.rsplit("/", 1)[-1]
+            if item_id in seen_ids_local: continue
+            seen_ids_local.add(item_id)
+            url = "https://jp.mercari.com" + href
+            title = (a.get_text(" ", strip=True) or "ayur chair")
+            price = parse_price(a.get_text(" ", strip=True))
+            items.append({"id": item_id, "title": title, "price": price, "url": url, "created": None})
+        return items
+    except Exception:
+        return []
+
+# ③ 取詳情上架時間（JST）
 def fetch_date(item_url: str, created_iso: str | None) -> str:
-    # 如果 API 已經提供 ISO 時間，直接用
     if created_iso:
         try:
             iso = created_iso.replace("Z", "+00:00")
@@ -157,7 +162,6 @@ def fetch_date(item_url: str, created_iso: str | None) -> str:
             return jst.strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
-    # 後備抓詳情
     try:
         r = requests.get(item_url, headers=HEADERS, timeout=30)
         r.raise_for_status()
@@ -182,12 +186,18 @@ def format_item(it, with_date=False) -> str:
     return f"{it['title']}{price_part}{date_str}\n{it['url']}"
 
 def main():
+    # Debug ping
     send_telegram("📡 Mercari Watch 測試訊息：workflow 已啟動")
     print(f"DEBUG: ALWAYS_SEND_LATEST={ALWAYS_SEND_LATEST}, LATEST_COUNT={LATEST_COUNT}")
-    print(f"DEBUG: SEARCH_URL={SEARCH_URL} USE_API={USE_API}")
+    print(f"DEBUG: SEARCH_URL={SEARCH_URL}")
 
     seen = load_seen()
-    items = fetch_list()
+
+    items = fetch_list_playwright()
+    if not items:
+        print("DEBUG: Playwright 無結果，改用 HTML 後備")
+        items = fetch_list_html()
+
     print(f"DEBUG: 列表抓到 {len(items)} 件")
 
     new_items = [it for it in items if it["id"] not in seen and match_filters(it["title"], it["price"])]
@@ -196,7 +206,7 @@ def main():
     messages = []
 
     if new_items:
-        msg = "🆕 Mercari 新上架 ayur chair（在售/由新至舊）\n\n"
+        msg = "🆕 Mercari 新上架 ayur chair（由新至舊）\n\n"
         for i, it in enumerate(new_items, 1):
             msg += f"{i}. {format_item(it, with_date=True)}\n\n"
         messages.append(msg.strip())
