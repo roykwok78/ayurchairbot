@@ -1,7 +1,7 @@
 name: Mercari Watch
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"   # 每30分鐘
   workflow_dispatch: {}
 permissions:
   contents: write
@@ -10,18 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Ensure state file
         run: |
           mkdir -p data
           if [ ! -f data/seen_ids.json ]; then echo "[]" > data/seen_ids.json; fi
+
       - name: Run watcher
         env:
           SEARCH_URL: ${{ secrets.SEARCH_URL }}
@@ -30,7 +34,10 @@ jobs:
           COLOR_KEYWORDS: ${{ secrets.COLOR_KEYWORDS }}
           MIN_PRICE: ${{ secrets.MIN_PRICE }}
           MAX_PRICE: ${{ secrets.MAX_PRICE }}
+          ALWAYS_SEND_LATEST: ${{ secrets.ALWAYS_SEND_LATEST }}
+          LATEST_COUNT: ${{ secrets.LATEST_COUNT }}
         run: python watcher.py
+
       - name: Commit state
         run: |
           git config user.name "github-actions[bot]"
