@@ -10,6 +10,7 @@ MIN_PRICE = int(os.getenv("MIN_PRICE") or "0")
 MAX_PRICE = int(os.getenv("MAX_PRICE") or "0")
 LATEST_COUNT = int(os.getenv("LATEST_COUNT") or "5")
 ALWAYS_SEND_LATEST = os.getenv("ALWAYS_SEND_LATEST") == "1"
+JPY_TO_HKD = float(os.getenv("JPY_TO_HKD") or "0.052")  # 1 JPY ≈ 0.052 HKD（可在 Secrets 覆蓋）
 SEEN_FILE = "data/seen_ids.json"
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -66,6 +67,13 @@ def match_filters(title: str, price: int) -> bool:
     if MIN_PRICE and price < MIN_PRICE: return False
     if MAX_PRICE and MAX_PRICE > 0 and price > MAX_PRICE: return False
     return True
+
+def jpy_to_hkd(price_jpy: int) -> int:
+    """把日元轉港幣（四捨五入至整數），用環境變數匯率。"""
+    try:
+        return int(round(price_jpy * JPY_TO_HKD))
+    except Exception:
+        return 0
 
 # -------- ① 用 Playwright 抓（渲染後 DOM）--------
 def fetch_list_playwright():
@@ -150,7 +158,6 @@ def fetch_list_playwright():
 
             # 初步價錢（臨時，稍後用詳情覆蓋）
             price = parse_price_any(card_text)
-
             items.append({"id": item_id, "title": title, "price": price, "url": url, "created_dt": None, "created_str": ""})
 
         context.close()
@@ -232,19 +239,33 @@ def enrich_with_details(items):
         if price: it["price"] = price
         it["created_dt"] = dt
         it["created_str"] = s
-        # 禮貌地睡一下，避免太頻繁（可按需調整/移除）
-        time.sleep(0.4)
+        time.sleep(0.4)  # 避免過快
 
-def format_item(it, with_date=False) -> str:
-    date_str = f"\n上架：{it.get('created_str')}" if (with_date and it.get("created_str")) else ""
-    price_part = f" ¥{it['price']:,}" if it["price"] else ""
-    return f"{it['title']}{price_part}{date_str}\n{it['url']}"
+def format_currency(n: int) -> str:
+    return f"{n:,}"
+
+def format_item(it) -> str:
+    """五行格式：
+    1. 標題
+    2. ¥38,000
+    3. ≈ HK$1,976
+    4. 2025-08-08 12:34
+    5. 連結
+    """
+    price_jpy = it.get("price") or 0
+    price_hkd = jpy_to_hkd(price_jpy) if price_jpy else 0
+    title_line = it["title"]
+    yen_line = f"¥{format_currency(price_jpy)}" if price_jpy else "價格：—"
+    hkd_line = f"≈ HK${format_currency(price_hkd)}" if price_hkd else "≈ HK$—"
+    date_line = it.get("created_str") or ""
+    url_line = it["url"]
+    return "\n".join([title_line, yen_line, hkd_line, date_line, url_line])
 
 # -------- 主流程 --------
 def main():
     # Debug ping
     send_telegram("📡 Mercari Watch 測試訊息：workflow 已啟動")
-    print(f"DEBUG: ALWAYS_SEND_LATEST={ALWAYS_SEND_LATEST}, LATEST_COUNT={LATEST_COUNT}")
+    print(f"DEBUG: ALWAYS_SEND_LATEST={ALWAYS_SEND_LATEST}, LATEST_COUNT={LATEST_COUNT}, JPY_TO_HKD={JPY_TO_HKD}")
     print(f"DEBUG: SEARCH_URL={SEARCH_URL}")
 
     seen = load_seen()
@@ -273,7 +294,7 @@ def main():
     if new_items:
         msg = "🆕 Mercari 新上架 ayur chair（只顯示在售；按上架時間排序）\n\n"
         for i, it in enumerate(new_items, 1):
-            msg += f"{i}. {format_item(it, with_date=True)}\n\n"
+            msg += f"{i}. {format_item(it)}\n\n"
         messages.append(msg.strip())
 
     if ALWAYS_SEND_LATEST:
@@ -282,7 +303,7 @@ def main():
         if latest:
             msg2 = f"📌 最新 {len(latest)} 個 ayur chair（只顯示在售；按上架時間排序）\n\n"
             for i, it in enumerate(latest, 1):
-                msg2 += f"{i}. {format_item(it, with_date=True)}\n\n"
+                msg2 += f"{i}. {format_item(it)}\n\n"
             messages.append(msg2.strip())
         else:
             messages.append("📌 最新清單：目前搜尋結果為空。")
