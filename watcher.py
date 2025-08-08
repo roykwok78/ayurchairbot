@@ -65,7 +65,6 @@ def match_filters(title: str, price: int) -> bool:
 
 # ① 用 Playwright 抓取（渲染後的 DOM）
 def fetch_list_playwright():
-    def fetch_list_playwright():
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
