@@ -20,7 +20,7 @@ HEADERS = {
     "Accept-Language": "ja,en;q=0.9,zh-TW;q=0.8",
 }
 
-PRICE_RE = re.compile(r"[￥¥]\s*([\d,]+)")
+PRICE_RE_ANY = re.compile(r"[￥¥]\s*([\d,]+)")
 
 # -------- 只在售：已售標記 & 判斷 --------
 SOLD_MARKERS = ["売り切れ", "SOLD", "SOLD OUT", "取引終了", "販売停止中", "売却済", "已售", "已售出", "已賣出", "售罄"]
@@ -54,15 +54,10 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"WARN: Telegram 推送失敗: {e}")
 
-def parse_price(text: str) -> int:
-    m = PRICE_RE.search(text.replace(",", ""))
-    if m:
-        try:
-            return int(m.group(1).replace(",", ""))
-        except Exception:
-            return 0
-    nums = re.findall(r"\d+", text)
-    return int(nums[0]) if nums else 0
+def parse_price_any(text: str) -> int:
+    """從任意文本裡抓到所有 ¥ 數字，取最大值避免抓到小數字（例如縮圖數）。"""
+    nums = [int(m.replace(",", "")) for m in PRICE_RE_ANY.findall(text.replace(",", ""))]
+    return max(nums) if nums else 0
 
 def match_filters(title: str, price: int) -> bool:
     t = (title or "").lower()
@@ -95,24 +90,17 @@ def fetch_list_playwright():
             user_agent=HEADERS["User-Agent"],
             viewport={"width": 1366, "height": 900},
         )
-        # 隱藏 webdriver
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
         page.set_default_timeout(30000)
 
         page.goto(SEARCH_URL, wait_until="domcontentloaded")
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
+        try: page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception: pass
 
-        # 可能的 Cookie 同意
-        try:
-            page.locator("button:has-text('同意')").first.click(timeout=2000)
-        except Exception:
-            pass
+        try: page.locator("button:has-text('同意')").first.click(timeout=2000)
+        except Exception: pass
 
-        # 捲動幾屏，觸發 lazyload
         try:
             for _ in range(6):
                 page.mouse.wheel(0, 1800)
@@ -137,36 +125,33 @@ def fetch_list_playwright():
                     el = parent.as_element() if parent else None
                     if el:
                         card_text = (el.inner_text() or "")
-                        if card_text.strip():
-                            break
-            if looks_sold(card_text):
-                continue
+                        if card_text.strip(): break
+            if looks_sold(card_text): continue
 
             item_id = href.rsplit("/", 1)[-1]
             if item_id in seen_ids_local: continue
             seen_ids_local.add(item_id)
             url = "https://jp.mercari.com" + href
 
-            # 標題：img alt 優先，否則從卡片文字抓
+            # 標題
             title = None
             try:
                 img = a.locator("img").first
                 alt = img.get_attribute("alt")
-                if alt:
-                    title = alt.strip()
+                if alt: title = alt.strip()
             except Exception:
                 pass
             if not title:
                 for piece in (card_text or "").split("\n"):
                     t = piece.strip()
                     if 6 <= len(t) <= 120 and "￥" not in t and "¥" not in t:
-                        title = t
-                        break
-            if not title:
-                title = "ayur chair"
+                        title = t; break
+            if not title: title = "ayur chair"
 
-            price = parse_price(card_text)
-            items.append({"id": item_id, "title": title, "price": price, "url": url, "created": None})
+            # 初步價錢（臨時，稍後用詳情覆蓋）
+            price = parse_price_any(card_text)
+
+            items.append({"id": item_id, "title": title, "price": price, "url": url, "created_dt": None, "created_str": ""})
 
         context.close()
         browser.close()
@@ -184,8 +169,7 @@ def fetch_list_html():
             href = a.get("href") or ""
             if not href.startswith("/item/"): continue
             card_text = a.get_text(" ", strip=True) or ""
-            if looks_sold(card_text):
-                continue
+            if looks_sold(card_text): continue
             item_id = href.rsplit("/", 1)[-1]
             if item_id in seen_ids_local: continue
             seen_ids_local.add(item_id)
@@ -193,44 +177,63 @@ def fetch_list_html():
             title = "ayur chair"
             if 6 <= len(card_text) <= 120 and "￥" not in card_text and "¥" not in card_text:
                 title = card_text
-            price = parse_price(card_text)
-            items.append({"id": item_id, "title": title, "price": price, "url": url, "created": None})
+            price = parse_price_any(card_text)
+            items.append({"id": item_id, "title": title, "price": price, "url": url, "created_dt": None, "created_str": ""})
         return items
     except Exception:
         return []
 
-# -------- 詳情頁取上架時間（JST）--------
-def fetch_date_dt(item_url: str, created_iso: str | None):
-    """回傳 (datetime_or_none, 'YYYY-MM-DD HH:MM' 或空字串) 皆為 JST"""
-    if created_iso:
-        try:
-            iso = created_iso.replace("Z", "+00:00")
-            dt_utc = datetime.datetime.fromisoformat(iso)
-            jst = dt_utc.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
-            return jst, jst.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            pass
+# -------- ③ 詳情頁拿「正確售價 + 上架時間（JST）」--------
+def fetch_detail(item_url: str):
+    """回傳 (price_int, created_dt, created_str)"""
     try:
         r = requests.get(item_url, headers=HEADERS, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # 先從 meta 拿價格
+        price_meta = None
+        for key in ("product:price:amount", "og:price:amount"):
+            m = soup.find("meta", attrs={"property": key})
+            if m and m.get("content"):
+                try:
+                    price_meta = int(m["content"].replace(",", "").strip())
+                    break
+                except Exception:
+                    pass
+        # meta 沒有就從頁面所有文本抓 ¥ 數字的最大值
+        if price_meta is None:
+            price_meta = parse_price_any(soup.get_text(" ", strip=True))
+
+        # 上架/更新時間（JST）
+        dt = None
+        s = ""
         for key in ("og:updated_time","product:price:updated_time","article:modified_time","og:published_time"):
             meta = soup.find("meta", attrs={"property": key})
             if meta and meta.get("content"):
                 iso = meta["content"].strip().replace("Z", "+00:00")
-                dt_utc = datetime.datetime.fromisoformat(iso)
-                jst = dt_utc.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
-                return jst, jst.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        pass
-    return None, ""
+                try:
+                    dt_utc = datetime.datetime.fromisoformat(iso)
+                    jst = dt_utc.astimezone(datetime.timezone(datetime.timedelta(hours=9)))
+                    dt, s = jst, jst.strftime("%Y-%m-%d %H:%M")
+                    break
+                except Exception:
+                    pass
 
-def enrich_with_dates(items):
-    """為每個 item 填入 created_dt / created_str（JST）"""
+        return price_meta or 0, dt, s
+    except Exception as e:
+        print(f"WARN: 取詳情失敗: {e}")
+        return 0, None, ""
+
+def enrich_with_details(items):
+    """為每個 item 補齊 正確價格 與 上架時間（JST）。"""
     for it in items:
-        dt, s = fetch_date_dt(it["url"], it.get("created"))
+        price, dt, s = fetch_detail(it["url"])
+        if price: it["price"] = price
         it["created_dt"] = dt
         it["created_str"] = s
+        # 禮貌地睡一下，避免太頻繁（可按需調整/移除）
+        time.sleep(0.4)
 
 def format_item(it, with_date=False) -> str:
     date_str = f"\n上架：{it.get('created_str')}" if (with_date and it.get("created_str")) else ""
@@ -246,7 +249,7 @@ def main():
 
     seen = load_seen()
 
-    # 先抓列表（Playwright → HTML 後備）
+    # 抓列表（Playwright → HTML 後備）
     items = fetch_list_playwright()
     if not items:
         print("DEBUG: Playwright 無結果，改用 HTML 後備")
@@ -254,17 +257,14 @@ def main():
 
     print(f"DEBUG: 列表初步抓到 {len(items)} 件（在售過濾後）")
 
-    # 先補上架日期
-    enrich_with_dates(items)
+    # 補齊詳情（正確價格 + 上架時間）
+    enrich_with_details(items)
 
     # 按上架時間由新到舊排序（無日期的排到最後）
-    items_sorted = sorted(
-        items,
-        key=lambda x: x.get("created_dt") or datetime.datetime(1970,1,1, tzinfo=datetime.timezone(datetime.timedelta(hours=9))),
-        reverse=True
-    )
+    jst_epoch = datetime.datetime(1970,1,1, tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
+    items_sorted = sorted(items, key=lambda x: x.get("created_dt") or jst_epoch, reverse=True)
 
-    # 新貨（在售 + 過濾 + 未見過），再按日期排序
+    # 新貨（過濾 & 未見過）
     new_items = [it for it in items_sorted if it["id"] not in seen and match_filters(it["title"], it["price"])]
     print(f"DEBUG: new_items={len(new_items)} / seen_ids={len(seen)}")
 
