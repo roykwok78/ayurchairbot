@@ -1,4 +1,16 @@
+name: Mercari Watch
+
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"   # 每30分鐘
   workflow_dispatch: {}
+
+permissions:
+  contents: write   # 允許把 seen_ids.json 回寫 repo
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      ...
